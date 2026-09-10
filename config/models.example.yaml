@@ -1,0 +1,46 @@
+connections:
+- id: deepseek
+  name: DeepSeek
+  protocol: openai_chat
+  base_url: https://api.deepseek.com/v1
+  builtin_provider_id: deepseek
+  api_key_env: DEEPSEEK_API_KEY
+- id: mock
+  name: 本地模拟
+  protocol: mock
+  base_url: first
+- id: human
+  name: 人类（网页落子）
+  protocol: human
+  base_url: ''
+presets:
+- id: mock-first
+  name: 模拟·首步
+  connection_id: mock
+  model: mock
+- id: mock-last
+  name: 模拟·末步
+  connection_id: mock
+  model: mock
+- id: human-red
+  name: 我执红
+  connection_id: human
+  model: human
+- id: human-black
+  name: 我执黑
+  connection_id: human
+  model: human
+- id: ds-flash
+  name: DeepSeek V4.1 Flash
+  connection_id: deepseek
+  model: deepseek-flash
+  temperature: 0.2
+  max_tokens: 16384
+  structured_output: false
+- id: ds-pro
+  name: DeepSeek V4 Pro
+  connection_id: deepseek
+  model: deepseek-v4-pro
+  temperature: 0.2
+  max_tokens: 16384
+  structured_output: false

@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*.db
+data/*.db-wal
+data/*.db-shm
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+config/models.yaml
+.env
+native/build/
+*.obj
+
+# Local migration/build materials and generated run artifacts.
+native/
+vendor/
+data/
+run/*.json
+run/*.log
+run/*.out
+run/check_submission_prompt.py
+server.*.log
