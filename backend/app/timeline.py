@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .record import REASON_LABELS, result_text
+
 # 工具名 → 网页上的中文说法，回放时读起来是「查询/试走」而不是函数名。
 TOOL_LABELS: dict[str, str] = {
     "get_position": "查询局面",
@@ -180,13 +182,19 @@ def _tool_brief(action: dict[str, Any]) -> str:
     return str(result.get("error") or "")
 
 
+def result_line(game: dict[str, Any]) -> str:
+    """回放抬头的结局：与棋谱导出同一套说法，截断/停止不写成和棋。"""
+    reason = REASON_LABELS.get(game.get("reason"), game.get("reason"))
+    return result_text(game) + (f" · {reason}" if reason else "")
+
+
 def render_timeline(game: dict[str, Any], timeline: dict[str, Any]) -> str:
     """命令行用的文本回放：每手一次汇总，下面是这一手的每个动作。"""
     side_labels = {"red": "红", "black": "黑"}
     shown = lambda value: "未知" if value is None else str(value)
     moves = timeline["moves"]
     lines = [f"对局 {game['id']} · 模式 {timeline['mode']} · 每手最多 {timeline['max_rounds']} 轮请求",
-             f"结果: {game.get('winner') or '和'} / {game.get('reason')} · 半回合 {len(game.get('history') or [])}"]
+             f"结果: {result_line(game)} · 半回合 {len(game.get('history') or [])}"]
     if not moves:
         lines.append("（没有智能体行动记录）")
         return "\n".join(lines) + "\n"

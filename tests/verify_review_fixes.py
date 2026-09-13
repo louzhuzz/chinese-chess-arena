@@ -260,6 +260,15 @@ def verify_record_labels() -> None:
           "结果     : 和棋" in draw and "终局局面已由裁判确认" in draw
           and "结果     : 红方胜" in mate and "终局局面已由裁判确认" in mate)
 
+    # 同一套说法也要用在行动回放抬头：截断/停止的回放不能写成「和」。
+    cases = (({"status": "stopped", "winner": None, "reason": "user_stopped"}, "未计胜负 · 手动停止"),
+             ({"status": "truncated", "winner": None, "reason": "max_plies"}, "未计胜负 · 步数上限截断"),
+             ({"status": "finished", "winner": None, "reason": "repetition_draw"}, "和棋 · 三次重复判和"),
+             ({"status": "finished", "winner": "red", "reason": "checkmate"}, "红方胜 · 将死"))
+    for row, expected in cases:
+        header = render_timeline(base | row, {"mode": "agent", "max_rounds": 6, "moves": [], "total": {}}).splitlines()[1]
+        check(f"5 行动回放抬头与棋谱同口径（{expected}）", header == f"结果: {expected} · 半回合 0", header)
+
 
 # ---------------------------------------------------------------- 7 + 8 + 9：预算与期限
 def verify_budget_and_deadline() -> None:

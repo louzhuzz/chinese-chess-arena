@@ -54,20 +54,31 @@ def fen_positions(game: dict[str, Any]) -> list[str]:
     return [game["initial_fen"], *(move["fen_after"] for move in plays(game))]
 
 
+def result_text(game: dict[str, Any]) -> str:
+    """结局说法：胜方 / 和棋 / 未计胜负 / 进行中。
+
+    只有裁判真正判定的和棋（重复、自然限着、子力不足）才叫和棋；手动停止、步数截断、
+    接口故障这些都是「未计胜负」，棋谱与行动回放共用这一份说法。
+    """
+    winner = game.get("winner")
+    reason_code = game.get("reason")
+    if winner:
+        return SIDE_LABELS.get(winner, winner) + "方胜"
+    if reason_code in DRAW_REASONS:
+        return "和棋"
+    if reason_code:
+        return "未计胜负"
+    if game.get("status") in {"queued", "running"}:
+        return "对局进行中"
+    return "未计胜负"
+
+
 def render_fen_record(game: dict[str, Any]) -> str:
     """标准棋谱文本（`game-<id8>-fen.txt` 的内容）。"""
     played = plays(game)
-    winner = game.get("winner")
     reason_code = game.get("reason")
     reason = REASON_LABELS.get(reason_code, reason_code)
-    if winner:
-        result = SIDE_LABELS.get(winner, winner) + "方胜"
-    elif reason_code in DRAW_REASONS:
-        result = "和棋"
-    elif reason_code:
-        result = "未计胜负"
-    else:
-        result = "对局进行中"
+    result = result_text(game)
     lines = [
         TITLE,
         HEADER_RULE,
