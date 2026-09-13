@@ -1,13 +1,16 @@
 import {useCallback,useEffect,useMemo,useRef,useState} from 'react';
-import {Activity,Archive,ChevronLeft,ChevronRight,CircleStop,Pencil,Play,RefreshCw,Settings2,Swords,Trophy} from 'lucide-react';
+import {Activity,Archive,ChevronLeft,ChevronRight,CircleStop,Download,Pencil,Play,RefreshCw,RotateCcw,Settings2,Swords,Trophy} from 'lucide-react';
 import {Board,PALETTE,PieceIcon,START_FEN,cleanFen,parseFen,setSideToMove,setSquareInFen} from './board';
 
-type Preset={id:string,name:string,connection_id:string,model:string;temperature?:number|null;max_tokens?:number;structured_output?:boolean;reasoning_effort?:'low'|'high'|'max'|null;thinking?:'enabled'|'disabled'|null};
+type Preset={id:string,name:string,connection_id:string,model:string;temperature?:number|null;max_tokens?:number;structured_output?:boolean;reasoning_effort?:'low'|'medium'|'high'|'max'|null;thinking?:'enabled'|'disabled'|null};
 type Connection={id:string,name:string,protocol:string;base_url:string;builtin_provider_id?:string|null;api_key_masked?:string|null;api_key_env?:string|null;extra_headers?:Record<string,string>};
 type BuiltinProvider={id:string;name:string;protocol:string;base_url:string;api_key_env:string;auth_mode:'api_key';models:string[];model_count:number;supported:boolean;discovery:string;note:string;aliases?:string[]};
 type MemoryEntry={ply:number;move:string;notation?:string|null;note:string};
 type ContextInfo={count:number;last_ply?:number|null};
-type Game={id:string,status:string;red_preset:string;black_preset:string;winner?:string|null;reason?:string|null;history?:string[];current_fen?:string;initial_fen?:string;moves?:Move[];awaiting?:string|null;legal_moves?:string[];in_check?:boolean;created_at:string;private_memory?:Record<string,MemoryEntry[]>;context_messages?:Record<string,ContextInfo>};
+type AgentAction={ply:number;side:string;sequence:number;kind:'request'|'tool'|'submit'|'text_submit';name?:string|null;label:string;args?:Record<string,unknown>|null;result?:Record<string,unknown>|null;text?:string|null;duration_ms?:number|null;error?:string|null;input_tokens?:number|null;output_tokens?:number|null;total_input_tokens?:number|null;cache_read_tokens?:number|null;cache_write_tokens?:number|null;connect_ms?:number|null;first_byte_ms?:number|null;provider_request_id?:string|null;finish_reason?:string|null;request?:Record<string,unknown>|null;raw?:Record<string,unknown>|null};
+type AgentMove={ply:number;side:string;attempts:number;duration_ms:number;input_tokens:number;output_tokens:number;cache_read_tokens:number;cache_write_tokens:number;requests:number;tools:number;submits:number;tool_errors:number;failed:boolean;cost_estimate:number|null;actions:AgentAction[]};
+type AgentTimeline={mode:string;max_rounds:number;moves:AgentMove[];total:{requests:number;tools:number;input_tokens:number;output_tokens:number;cache_read_tokens:number;cache_write_tokens:number;duration_ms:number;cost_estimate:number|null}};
+type Game={id:string,status:string;red_preset:string;black_preset:string;winner?:string|null;reason?:string|null;history?:string[];current_fen?:string;initial_fen?:string;moves?:Move[];awaiting?:string|null;legal_moves?:string[];in_check?:boolean;created_at:string;move_timeout?:number;max_plies?:number;mode?:'direct'|'agent';agent_max_rounds?:number;timeline?:AgentTimeline;private_memory?:Record<string,MemoryEntry[]>;context_messages?:Record<string,ContextInfo>};
 type Move={ply:number;side:string;move?:string|null;notation?:string|null;fen_before:string;fen_after?:string|null;response_text?:string;duration_ms?:number;connect_ms?:number|null;first_byte_ms?:number|null;provider_request_id?:string|null;total_input_tokens?:number|null;cache_read_tokens?:number|null;cache_write_tokens?:number|null;cache_miss_tokens?:number|null;attempt:number;error?:string|null;note?:string|null};
 type UsageRow={preset_id:string;moves:number;attempts:number;input_tokens:number|null;output_tokens:number|null;total_input_tokens:number|null;cache_read_tokens:number|null;cache_write_tokens:number|null;cache_miss_tokens:number|null;cache_hit_rate:number|null;duration_ms:number;cost_estimate:number|null};
 type ModelResult={wins:number;losses:number;draws:number;games:number;score_rate:number|null};
@@ -19,8 +22,16 @@ const api=async<T,>(path:string,init?:RequestInit):Promise<T>=>{const r=await fe
 
 const REASON:Record<string,string>={checkmate:'将死',stalemate:'困毙',repetition_draw:'重复局面和棋',natural_limit_draw:'自然限着和棋',insufficient_material:'子力不足和棋',perpetual_check:'长将判负',perpetual_chase:'长捉判负',invalid_move:'非法着法判负',timeout:'超时判负',api_failure:'接口故障',max_plies:'步数上限截断',user_stopped:'手动停止',process_restart:'进程重启中断'};
 
+// 一手失败时的原因码：网页上要能直接读出「输出预算用尽」还是「轮数用尽」，而不是只看到一个英文码。
+const MOVE_ERROR:Record<string,string>={'agent_no_submit':'整手没有正式落子','agent_rounds_exhausted':'每手请求轮数用尽，仍未落子','agent_output_limit':'整手输出预算用尽（被 max_tokens 截断）','request_timeout':'本次请求超时','api_error':'接口故障','invalid_move':'非法着法','timeout':'超时'};
+function errorText(code:string){const key=Object.keys(MOVE_ERROR).find(item=>code.startsWith(item));return key?`${MOVE_ERROR[key]}（${code}）`:code}
+
+// 每步总时限的常用档位；后端默认 600 秒，首答可用的时间是「时限 - 最多 30 秒纠错余量」。
+const TIMEOUT_PRESETS:[number,string][]=[[120,'2 分钟'],[300,'5 分钟'],[600,'10 分钟'],[1800,'30 分钟']];
+
 export function App(){
- const [tab,setTab]=useState<'arena'|'bench'|'history'|'settings'>('arena'),[presets,setPresets]=useState<Preset[]>([]),[connections,setConnections]=useState<Connection[]>([]),[providerCatalog,setProviderCatalog]=useState<BuiltinProvider[]>([]),[games,setGames]=useState<Game[]>([]),[benchmarks,setBenchmarks]=useState<Benchmark[]>([]),[report,setReport]=useState<Benchmark|null>(null),[health,setHealth]=useState<Health|null>(null),[active,setActive]=useState<Game|null>(null),[red,setRed]=useState(''),[black,setBlack]=useState(''),[redEffort,setRedEffort]=useState('default'),[blackEffort,setBlackEffort]=useState('default'),[replay,setReplay]=useState(0),[pairs,setPairs]=useState(5),[moveTimeout,setMoveTimeout]=useState(120),[maxPlies,setMaxPlies]=useState(400),[notice,setNotice]=useState('');
+ const [tab,setTab]=useState<'arena'|'bench'|'history'|'settings'>('arena'),[presets,setPresets]=useState<Preset[]>([]),[connections,setConnections]=useState<Connection[]>([]),[providerCatalog,setProviderCatalog]=useState<BuiltinProvider[]>([]),[games,setGames]=useState<Game[]>([]),[benchmarks,setBenchmarks]=useState<Benchmark[]>([]),[report,setReport]=useState<Benchmark|null>(null),[health,setHealth]=useState<Health|null>(null),[active,setActive]=useState<Game|null>(null),[red,setRed]=useState(''),[black,setBlack]=useState(''),[redEffort,setRedEffort]=useState('default'),[blackEffort,setBlackEffort]=useState('default'),[replay,setReplay]=useState(0),[pairs,setPairs]=useState(5),[moveTimeout,setMoveTimeout]=useState(600),[maxPlies,setMaxPlies]=useState(400),[notice,setNotice]=useState('');
+ const [mode,setMode]=useState<'direct'|'agent'>('direct'),[agentRounds,setAgentRounds]=useState(6);
  const [selected,setSelected]=useState<string|null>(null),[busy,setBusy]=useState(false);
  const [editor,setEditor]=useState(false),[editFen,setEditFen]=useState(cleanFen(START_FEN)),[editPiece,setEditPiece]=useState<string>('R'),[editNote,setEditNote]=useState('');
  const load=useCallback(async()=>{
@@ -41,10 +52,12 @@ export function App(){
  const isHuman=useCallback((presetId:string)=>protocolOf(presetId)==='human',[protocolOf]);
  const humanSide=(game:Game|null,side:string)=>!!game&&isHuman(side==='red'?game.red_preset:game.black_preset);
 
- const gameSettings={move_timeout_seconds:moveTimeout,max_plies:maxPlies,red_reasoning_effort:redEffort,black_reasoning_effort:blackEffort};
+ const gameSettings={move_timeout_seconds:moveTimeout,max_plies:maxPlies,red_reasoning_effort:redEffort,black_reasoning_effort:blackEffort,mode,agent_max_rounds:agentRounds};
  const start=async()=>{try{const g=await api<{id:string}>('/api/games',{method:'POST',body:JSON.stringify({red_preset_id:red,black_preset_id:black,...gameSettings})});await open(g.id)}catch(e){setNotice(String(e))}};
- const startBench=async()=>{try{const b=await api<{id:string}>('/api/benchmarks',{method:'POST',body:JSON.stringify({preset_a_id:red,preset_b_id:black,pairs,move_timeout_seconds:moveTimeout,max_plies:maxPlies,preset_a_reasoning_effort:redEffort,preset_b_reasoning_effort:blackEffort})});setNotice(`评测 ${b.id.slice(0,8)} 已排队，共 ${pairs*2} 局`);await openReport(b.id)}catch(e){setNotice(String(e))}};
+ const startBench=async()=>{try{const b=await api<{id:string}>('/api/benchmarks',{method:'POST',body:JSON.stringify({preset_a_id:red,preset_b_id:black,pairs,move_timeout_seconds:moveTimeout,max_plies:maxPlies,preset_a_reasoning_effort:redEffort,preset_b_reasoning_effort:blackEffort,mode,agent_max_rounds:agentRounds})});setNotice(`评测 ${b.id.slice(0,8)} 已排队，共 ${pairs*2} 局`);await openReport(b.id)}catch(e){setNotice(String(e))}};
  const startFromEditor=async()=>{try{const g=await api<{id:string}>('/api/games',{method:'POST',body:JSON.stringify({red_preset_id:red,black_preset_id:black,initial_fen:cleanFen(editFen),...gameSettings})});await open(g.id)}catch(e){setNotice(String(e))}};
+  // 以当前显示的盘面（含回放位置）另开一局：沿用这局的红黑模型、时限与对弈模式，行棋方由 FEN 决定。
+  const continueFromBoard=async()=>{try{const g=await api<{id:string}>('/api/games',{method:'POST',body:JSON.stringify({red_preset_id:active?.red_preset||red,black_preset_id:active?.black_preset||black,initial_fen:cleanFen(fen??START_FEN),move_timeout_seconds:active?.move_timeout??moveTimeout,max_plies:active?.max_plies??maxPlies,mode:active?.mode??mode,agent_max_rounds:active?.agent_max_rounds??agentRounds,red_reasoning_effort:redEffort,black_reasoning_effort:blackEffort})});await open(g.id)}catch(e){setNotice(String(e))}};
  const readFen=async(text:string)=>{try{const r=await api<Analysis>('/api/analyze',{method:'POST',body:JSON.stringify({fen:text})});setEditFen(cleanFen(r.fen));setEditNote(`合法着法 ${r.legal_moves.length} 步`)}catch(e){setEditNote(String(e))}};
 
  const played=useMemo(()=>(active?.moves||[]).filter(m=>m.move&&!m.error&&m.fen_after),[active]);
@@ -80,7 +93,7 @@ export function App(){
    const failed=(active.moves||[]).filter(m=>m.error);
    if(!failed.length)return '';
    const fatal=['api_failure','invalid_move','timeout','arbiter_failure'].some(prefix=>active.reason?.startsWith(prefix));
-   return fatal?failed[failed.length-1].error||'':'';
+   return fatal?errorText(failed[failed.length-1].error||''):'';
  },[active]);
 
  const judge=health?.arbiter?.backend||'未检测';
@@ -96,7 +109,7 @@ export function App(){
     {editNote&&<small className="editor-note">{editNote}</small>}
     <div className="editor-actions"><button onClick={()=>{setEditFen(cleanFen(START_FEN));setEditNote('')}}>标准开局</button><button onClick={()=>{setEditFen(cleanFen('9/9/9/9/9/9/9/9/9/9 w - - 0 1'));setEditNote('')}}>清空棋盘</button></div>
     <button className="primary" onClick={startFromEditor}><Play/>以此开局</button>
-    <button onClick={()=>setEditor(false)}>返回对局</button>
+    <button className="secondary" onClick={()=>setEditor(false)}>返回对局</button>
   </aside>:<aside className="match-card">
     <p className="eyebrow">NEW MATCH</p><h1>两军对垒</h1>
     <label>执红模型<select value={red} onChange={e=>setRed(e.target.value)}>{presets.map(p=><option key={p.id} value={p.id}>{p.name} · {p.model}</option>)}</select></label>
@@ -105,12 +118,14 @@ export function App(){
     <label>执黑模型<select value={black} onChange={e=>setBlack(e.target.value)}>{presets.map(p=><option key={p.id} value={p.id}>{p.name} · {p.model}</option>)}</select></label>
     <EffortSelect label="黑方思考强度" value={blackEffort} onChange={setBlackEffort}/>
     <div className="limits"><label>每步时限（秒）<input type="number" min="5" max="3600" value={moveTimeout} onChange={e=>setMoveTimeout(+e.target.value)}/></label><label>最大单方着数<input type="number" min="1" max="2000" value={maxPlies} onChange={e=>setMaxPlies(+e.target.value)}/></label></div>
+    <div className="quick">{TIMEOUT_PRESETS.map(([seconds,label])=><button key={seconds} className={moveTimeout===seconds?'on':''} onClick={()=>setMoveTimeout(seconds)}>{label}</button>)}</div>
+    <div className="mode-pick"><span>对弈模式</span><div><button className={mode==='direct'?'on':''} onClick={()=>setMode('direct')} title="每次请求直接提交一步，规则事实由提示词给出">一次定一步</button><button className={mode==='agent'?'on':''} onClick={()=>setMode('agent')} title="一手之内可以连续调用规则工具：查询合法着法、试走变化、校验并修正，直到正式提交">规则工具</button></div>{mode==='agent'&&<label className="rounds">每手最多请求<input type="number" min="1" max="12" value={agentRounds} onChange={e=>setAgentRounds(+e.target.value)}/>次</label>}</div>
     <button className="primary" onClick={start}><Play/>开始一局</button>
-    <button onClick={()=>{setEditFen(cleanFen(fen??START_FEN));setEditor(true)}}><Pencil/>自由摆棋</button>
+    <button className="secondary" onClick={()=>{setEditFen(cleanFen(fen??START_FEN));setEditor(true)}}><Pencil/>自由摆棋</button>
     <div className="batch"><input type="number" min="1" max="100" value={pairs} onChange={e=>setPairs(+e.target.value)}/><span>对交换先后</span><button onClick={startBench}><Trophy/>批量评测</button></div>
   </aside>}
-  <section className="board-panel"><div className={`player black${!editor&&sideToMove==='black'?' turn':''}`}><span className="disc">黑</span><div><small>BLACK</small><b>{active&&!editor?name(active.black_preset,presets):'等待开局'}</b></div><em>{editor?'摆棋':active?.status||'IDLE'}</em></div><Board fen={editor?editFen:(fen??START_FEN)} lastMove={editor?null:lastMove} selected={editor?null:selected} targets={editor?[]:targets} onSquare={editor||canPlay?onSquare:undefined}/><div className="board-status">{statusText}</div><div className={`player red${!editor&&sideToMove==='red'?' turn':''}`}><span className="disc">红</span><div><small>RED</small><b>{active&&!editor?name(active.red_preset,presets):'等待开局'}</b></div>{active?.status==='running'&&!editor?<button className="stop" onClick={()=>api(`/api/games/${active.id}/stop`,{method:'POST'}).then(()=>open(active.id))}><CircleStop/>停止</button>:<em>{editor?'摆棋模式':lastMoveNotation?`上一手 ${lastMoveNotation}`:'开局局面'}</em>}</div></section>
-  <aside className="record"><div className="record-head"><div><p className="eyebrow">LIVE RECORD</p><h2>行棋记录</h2></div><button onClick={()=>active&&open(active.id)}><RefreshCw/></button></div>{!active?<Empty/>:<><div className="result"><b>{resultText(active)}</b><small>{reasonText(active)||`第 ${(active.history||[]).length} 手`}</small>{failureNote&&<small className="failure">{failureNote}</small>}</div><div className="moves">{(active.moves||[]).filter(m=>m.move||m.error).map(m=><button key={`${m.ply}-${m.attempt}`} title={m.error||m.response_text||''} className={`${m.error?'bad':''}${replay===m.ply+1&&!m.error?' on':''}`} onClick={()=>setReplay(Math.min(m.ply+1,(active.history||[]).length))}><span>{m.ply+1}</span><b>{m.notation||m.move||'异常'}</b><small>{m.move?`${m.move} · `:''}{m.duration_ms} ms {m.attempt>1?'· 纠错':''}</small>{m.note&&<i>{m.note}</i>}{(m.connect_ms!=null||m.first_byte_ms!=null||m.provider_request_id)&&<i className="request-meta">连接 {metric(m.connect_ms)} · 首字节 {metric(m.first_byte_ms)}{m.provider_request_id&&` · ID ${m.provider_request_id}`}</i>}{(m.total_input_tokens!=null||m.cache_read_tokens!=null)&&<i className="request-meta">缓存命中 {m.cache_read_tokens??'—'} / {m.total_input_tokens??'—'} token · {cacheRate(m.cache_read_tokens,m.total_input_tokens)}</i>}</button>)}</div><div className="replay"><button onClick={()=>setReplay(Math.max(0,replay-1))}><ChevronLeft/></button><span>{replay} / {(active.history||[]).length}</span><button onClick={()=>setReplay(Math.min((active.history||[]).length,replay+1))}><ChevronRight/></button></div><details><summary>当前棋子位置表</summary><div className="piece-table">{[...boardPieces.entries()].sort().map(([square,piece])=><code key={square}>{square} {piece}</code>)}</div></details><details><summary>双方私有记忆</summary>{(['red','black'] as const).map(side=><section className="memory" key={side}><b>{side==='red'?'红方':'黑方'}</b>{(active.private_memory?.[side]||[]).map(x=><p key={x.ply}>{x.ply+1}. {x.notation||x.move} · {x.note}</p>)}{!(active.private_memory?.[side]||[]).length&&<p>暂无笔记</p>}</section>)}</details><details><summary>请求与归档</summary>{(['red','black'] as const).map(side=><section className="memory" key={side}><b>{side==='red'?'红方':'黑方'}</b><p>{active.context_messages?.[side]?.count||0} 条已归档消息</p><p>每次只发送当前全盘、最近 8 步与本方最新短笔记；归档消息不重复发送。</p></section>)}</details></>}</aside></main>}
+  <section className="board-panel"><div className={`player black${!editor&&sideToMove==='black'?' turn':''}`}><span className="disc">黑</span><div><small>BLACK</small><b>{active&&!editor?name(active.black_preset,presets):'等待开局'}</b></div><em>{editor?'摆棋':active?.status||'IDLE'}</em></div><Board fen={editor?editFen:(fen??START_FEN)} lastMove={editor?null:lastMove} selected={editor?null:selected} targets={editor?[]:targets} onSquare={editor||canPlay?onSquare:undefined}/><div className="board-status">{statusText}</div><div className={`player red${!editor&&sideToMove==='red'?' turn':''}`}><span className="disc">红</span><div><small>RED</small><b>{active&&!editor?name(active.red_preset,presets):'等待开局'}</b></div><div className="player-actions">{active&&!editor&&<button className="resume" onClick={continueFromBoard} title="以当前显示的盘面另开一局，沿用这局的红黑模型与时限"><RotateCcw/>从当前盘面继续</button>}{active?.status==='running'&&!editor?<button className="stop" onClick={()=>api(`/api/games/${active.id}/stop`,{method:'POST'}).then(()=>open(active.id))}><CircleStop/>停止</button>:<em>{editor?'摆棋模式':lastMoveNotation?`上一手 ${lastMoveNotation}`:'开局局面'}</em>}</div></div></section>
+  <aside className="record"><div className="record-head"><div><p className="eyebrow">LIVE RECORD</p><h2>行棋记录</h2></div><div className="record-actions">{active&&<a className="export" href={`/api/games/${active.id}/export.fen`} download title="导出 FEN 棋谱（标准格式）"><Download/>FEN 棋谱</a>}{active?.timeline&&<a className="export" href={`/api/games/${active.id}/timeline.txt`} download title="导出智能体行动回放（每手的请求、工具调用与费用）"><Download/>回放</a>}<button onClick={()=>active&&open(active.id)}><RefreshCw/></button></div></div>{!active?<Empty/>:<><div className="result"><b>{resultText(active)}</b><small>{reasonText(active)||`第 ${(active.history||[]).length} 手`}</small>{failureNote&&<small className="failure">{failureNote}</small>}</div><div className="moves">{(active.moves||[]).filter(m=>m.move||m.error).map(m=><button key={`${m.ply}-${m.attempt}`} title={m.error||m.response_text||''} className={`${m.error?'bad':''}${replay===m.ply+1&&!m.error?' on':''}`} onClick={()=>setReplay(Math.min(m.ply+1,(active.history||[]).length))}><span>{m.ply+1}</span><b>{m.notation||m.move||'异常'}</b><small>{m.move?`${m.move} · `:''}{m.duration_ms} ms {m.attempt>1?'· 纠错':''}</small><MoveChain timeline={active.timeline} ply={m.ply}/>{m.note&&<i>{m.note}</i>}{(m.connect_ms!=null||m.first_byte_ms!=null||m.provider_request_id)&&<i className="request-meta">连接 {metric(m.connect_ms)} · 首字节 {metric(m.first_byte_ms)}{m.provider_request_id&&` · ID ${m.provider_request_id}`}</i>}{(m.total_input_tokens!=null||m.cache_read_tokens!=null)&&<i className="request-meta">缓存命中 {m.cache_read_tokens??'—'} / {m.total_input_tokens??'—'} token · {cacheRate(m.cache_read_tokens,m.total_input_tokens)}</i>}</button>)}</div>{active.timeline&&<AgentTrace timeline={active.timeline} sideNames={side=>side==='red'?'红':'黑'}/>}<div className="replay"><button onClick={()=>setReplay(Math.max(0,replay-1))}><ChevronLeft/></button><span>{replay} / {(active.history||[]).length}</span><button onClick={()=>setReplay(Math.min((active.history||[]).length,replay+1))}><ChevronRight/></button></div><details><summary>当前棋子位置表</summary><div className="piece-table">{[...boardPieces.entries()].sort().map(([square,piece])=><code key={square}>{square} {piece}</code>)}</div></details><details><summary>双方私有记忆</summary>{(['red','black'] as const).map(side=><section className="memory" key={side}><b>{side==='red'?'红方':'黑方'}</b>{(active.private_memory?.[side]||[]).map(x=><p key={x.ply}>{x.ply+1}. {x.notation||x.move} · {x.note}</p>)}{!(active.private_memory?.[side]||[]).length&&<p>暂无笔记</p>}</section>)}</details><details><summary>请求与归档</summary>{(['red','black'] as const).map(side=><section className="memory" key={side}><b>{side==='red'?'红方':'黑方'}</b><p>{active.context_messages?.[side]?.count||0} 条已归档消息</p><p>每次只发送当前全盘、最近 8 步与本方最新短笔记；归档消息不重复发送。</p></section>)}</details></>}</aside></main>}
  {tab==='bench'&&<Benchmarks report={report} benchmarks={benchmarks} presets={presets} onOpen={openReport} onGame={open}/>}
  {tab==='history'&&<main className="library"><div className="title"><p className="eyebrow">ARCHIVE</p><h1>棋谱库</h1></div><div className="game-list">{games.map(g=><button key={g.id} onClick={()=>open(g.id)}><span className={`status ${g.status}`}/><b>{name(g.red_preset,presets)}</b><i>对</i><b>{name(g.black_preset,presets)}</b><em>{resultText(g)}</em><small>{new Date(g.created_at).toLocaleString()}</small></button>)}</div></main>}
  {tab==='settings'&&<Settings presets={presets} connections={connections} providerCatalog={providerCatalog} onSaved={load} notify={setNotice}/>}<footer>规则裁判 <b>{judge}</b><span>坐标 a0—i9 · 红方视角</span></footer></div>
@@ -119,8 +134,45 @@ const GLYPH_NAME:Record<string,string>={R:'車 车',N:'馬 马',B:'相',A:'仕',
 function name(id:string,p:Preset[]){return p.find(x=>x.id===id)?.name||id}
 function metric(value:number|null|undefined){return value==null?'—':`${value} ms`}
 function cacheRate(read:number|null|undefined,total:number|null|undefined){return read==null||total==null||!total?'—':`${(read/total*100).toFixed(1)}%`}
+function token(value:number|null|undefined){return value==null?'未知':String(value)}
+function costOf(value:number|null|undefined){return value==null?'未知':value.toFixed(4)}
+function agentMoveOf(timeline:AgentTimeline|undefined,ply:number){return timeline?.moves.find(move=>move.ply===ply)}
+function MoveChain({timeline,ply}:{timeline?:AgentTimeline;ply:number}){const move=agentMoveOf(timeline,ply);const chain=move?chainOf(move):'';return chain?<i className="chain">{chain}</i>:null}
+// 一步的工具调用摘要：读起来是「查询合法走法 → 试走变化 → 正式落子 a0a1」。
+function chainOf(move:AgentMove){return move.actions.filter(a=>a.kind==='tool'||a.kind==='submit'||a.kind==='text_submit').map(a=>a.kind==='tool'?a.label:`${a.label} ${String(a.args?.move??'')}`.trim()).join(' → ')}
+function briefOf(action:AgentAction){
+ const result=(action.result||{}) as Record<string,unknown>;
+ if(action.kind==='tool'){
+  if(action.name==='get_legal_moves')return `${result.count??'?'} 个合法着法`;
+  if(action.name==='check_move')return result.legal?'合法':`非法：${String(result.reason??'')}`;
+  if(action.name==='simulate_line'){const steps=(result.steps||[]) as {index:number;legal:boolean;reason?:string}[];const bad=steps.find(s=>!s.legal);const tail=result.ended?`，终局：${String(result.reason??'')}`:'';return bad?`${steps.length} 步变化，第 ${bad.index+1} 步非法${tail}`:`${steps.length} 步变化全部合法${tail}`}
+  if(action.name==='write_note')return '已替换为本手笔记';
+  if(action.name==='read_note')return result.private_note?'读到本方笔记':'无笔记';
+  if(action.name==='get_history')return `${((result.moves||[]) as string[]).length} 个半回合`;
+  if(action.name==='get_position')return `手数 ${result.ply}，行棋方 ${result.side_to_move}`;
+  if(action.name==='submit_move')return result.accepted?`接受 ${result.move}`:`拒绝：${String(result.reason??'')}`;
+  return action.error||'';
+ }
+ return `接受 ${String(result.move??'')}`;
+}
+// 智能体游戏才有的行动回放：每个手数一条链条，展开能看每次工具调用的输入、返回、耗时与费用。
+function AgentTrace({timeline,sideNames}:{timeline:AgentTimeline;sideNames:(side:string)=>string}){
+ return <details className="agent-trace"><summary>智能体行动回放 · 请求 {timeline.total.requests} 次 · 工具 {timeline.total.tools} 次 · 输入 {token(timeline.total.input_tokens)} token（缓存读 {token(timeline.total.cache_read_tokens)} / 写 {token(timeline.total.cache_write_tokens)}）· 输出 {token(timeline.total.output_tokens)} token · 估算费用 {costOf(timeline.total.cost_estimate)}</summary>
+  <div className="trace-list">{timeline.moves.map(move=><article key={`${move.ply}-${move.side}`} className={move.failed?'bad':''}>
+   <header><b>{move.ply+1}</b><span>{sideNames(move.side)}方</span><em>{move.requests} 次请求 · {move.tools} 次工具{move.tool_errors?` · ${move.tool_errors} 次被拒`:''} · 输入 {token(move.input_tokens)}（缓存读 {token(move.cache_read_tokens)}）· 输出 {token(move.output_tokens)} · {(move.duration_ms/1000).toFixed(1)} s · 估算费用 {costOf(move.cost_estimate)}</em></header>
+   {chainOf(move)&&<p className="chain">{chainOf(move)}</p>}
+   <ul>{move.actions.map(action=><li key={action.sequence} className={action.error?'bad':''}>
+    <span className="kind">{action.label}</span>
+    {action.kind==='request'
+     ?<span className="detail">第 {String(action.args?.round??'?')} 轮 · 可用工具 {((action.args?.tools||[]) as string[]).length} 个 · max_tokens {token(action.request?.max_tokens as number??action.args?.max_tokens as number)} · 时限 {token(action.request?.timeout_seconds as number??action.args?.timeout_seconds as number)} s · in {token(action.total_input_tokens??action.input_tokens)} / out {token(action.output_tokens)} · {metric(action.duration_ms)}{action.connect_ms!=null?` · 连接 ${metric(action.connect_ms)}`:''}{action.first_byte_ms!=null?` · 首字节 ${metric(action.first_byte_ms)}`:''}{action.finish_reason?` · 结束原因 ${action.finish_reason}`:''}{action.error?` · ${errorText(action.error)}`:''}</span>
+     :<span className="detail">{action.args&&Object.keys(action.args).length?`${JSON.stringify(action.args)} → `:''}{briefOf(action)}</span>}
+    {action.provider_request_id&&<i>ID {action.provider_request_id}</i>}
+   </li>)}</ul>
+  </article>)}</div>
+ </details>;
+}
 function EffortSelect({label,value,onChange}:{label:string;value:string;onChange:(value:string)=>void}){
- return <label className="effort-select">{label}<select value={value} onChange={e=>onChange(e.target.value)}><option value="default">提供方默认</option><option value="none">关闭思考</option><option value="low">低</option><option value="high">高</option><option value="max">最高</option></select></label>
+ return <label className="effort-select">{label}<select value={value} onChange={e=>onChange(e.target.value)}><option value="default">提供方默认</option><option value="none">关闭思考</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label>
 }
 function reasonText(g:Game){return g.reason?REASON[g.reason]||g.reason:''}
 function resultText(g:Game){if(g.status==='running'||g.status==='queued')return '对局进行中';if(g.winner)return `${g.winner==='red'?'红':'黑'}方胜`;if(g.reason&&REASON[g.reason]?.endsWith('和棋'))return REASON[g.reason];return ({truncated:'已截断',stopped:'已停止',interrupted:'已中断',aborted:'已中止'} as Record<string,string>)[g.status]||'和棋'}
@@ -129,7 +181,7 @@ function Empty(){return <div className="empty"><Activity/><b>尚无对局</b><sp
 function Benchmarks({report,benchmarks,presets,onOpen,onGame}:{report:Benchmark|null;benchmarks:Benchmark[];presets:Preset[];onOpen:(id:string)=>void;onGame:(id:string)=>void}){
  if(!report)return <main className="library"><div className="title"><p className="eyebrow">BENCHMARK</p><h1>批量评测</h1><p>在对弈台选择两个模型与对数，评测会交换先后各下一局。</p></div><div className="game-list">{benchmarks.map(b=><button key={b.id} onClick={()=>onOpen(b.id)}><span className={`status ${b.status}`}/><b>{name(b.preset_a,presets)}</b><i>对</i><b>{name(b.preset_b,presets)}</b><em>{b.pairs} 对 · {b.status}</em><small>{new Date(b.created_at).toLocaleString()}</small></button>)}</div></main>;
  const stats=report.stats||{};
- return <main className="library"><div className="title"><p className="eyebrow">REPORT {report.id.slice(0,8).toUpperCase()}</p><h1>{name(report.preset_a,presets)} 对 {name(report.preset_b,presets)}</h1><p>{report.pairs} 对交换先后 · {report.status}</p></div>
+ return <main className="library"><div className="title"><p className="eyebrow">REPORT {report.id.slice(0,8).toUpperCase()}</p><h1>{name(report.preset_a,presets)} 对 {name(report.preset_b,presets)}</h1><p>{report.pairs} 对交换先后 · {report.status} · {report.settings?.mode==='agent'?`规则工具模式（每手最多 ${report.settings?.agent_max_rounds??6} 轮请求）`:'一次定一步'}</p></div>
   <div className="stats-grid">
    {[['总局数',stats.games],['计入胜负',stats.decided],['红胜',stats.red_wins],['黑胜',stats.black_wins],['和棋',stats.draws],['技术判负',stats.forfeit_wins],['接口故障',stats.api_failures],['截断',stats.truncated]].map(([label,value])=><div className="stat" key={String(label)}><b>{value??'—'}</b><span>{label}</span></div>)}
   </div>

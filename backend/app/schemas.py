@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 
 Protocol = Literal["openai_chat", "openai_responses", "anthropic_messages", "mock", "human"]
+
+# 每步总时限的默认值。慢速推理模型经常想 1-3 分钟，默认给 10 分钟。
+# 可用环境变量 XIANGQI_MOVE_TIMEOUT 覆盖（有效范围 5-3600 秒）。
+DEFAULT_MOVE_TIMEOUT = 600
+
+
+def _default_move_timeout() -> int:
+    raw = os.getenv("XIANGQI_MOVE_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_MOVE_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MOVE_TIMEOUT
+    return min(max(value, 5), 3600)
 
 
 class ConnectionIn(BaseModel):
@@ -40,7 +56,7 @@ class Preset(BaseModel):
     temperature: float | None = Field(default=0.2, ge=0, le=2)
     max_tokens: int = Field(default=4096, ge=1, le=131072)
     structured_output: bool = True
-    reasoning_effort: Literal["low", "high", "max"] | None = None
+    reasoning_effort: Literal["low", "medium", "high", "max"] | None = None
     thinking: Literal["enabled", "disabled"] | None = None
     input_price_per_million: float | None = Field(default=None, ge=0)
     output_price_per_million: float | None = Field(default=None, ge=0)
@@ -62,7 +78,7 @@ class PositionView(BaseModel):
     in_check: bool
     ruleset_id: str
     fen: str
-    move_timeout_seconds: int = Field(default=120, ge=5, le=3600)
+    move_timeout_seconds: int = Field(default_factory=_default_move_timeout, ge=5, le=3600)
     private_memory: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -70,10 +86,13 @@ class GameCreate(BaseModel):
     red_preset_id: str
     black_preset_id: str
     initial_fen: str | None = None
-    move_timeout_seconds: int = Field(default=120, ge=5, le=3600)
+    move_timeout_seconds: int = Field(default_factory=_default_move_timeout, ge=5, le=3600)
     max_plies: int = Field(default=400, ge=1, le=2000)
-    red_reasoning_effort: Literal["default", "none", "low", "high", "max"] = "default"
-    black_reasoning_effort: Literal["default", "none", "low", "high", "max"] = "default"
+    red_reasoning_effort: Literal["default", "none", "low", "medium", "high", "max"] = "default"
+    black_reasoning_effort: Literal["default", "none", "low", "medium", "high", "max"] = "default"
+    # direct：一次请求提交一步（原有契约）；agent：一手之内可连续调用规则工具再提交。
+    mode: Literal["direct", "agent"] = "direct"
+    agent_max_rounds: int = Field(default=6, ge=1, le=20)
 
 
 class BenchmarkCreate(BaseModel):
@@ -81,10 +100,12 @@ class BenchmarkCreate(BaseModel):
     preset_b_id: str
     pairs: int = Field(default=5, ge=1, le=100)
     initial_fen: str | None = None
-    move_timeout_seconds: int = Field(default=120, ge=5, le=3600)
+    move_timeout_seconds: int = Field(default_factory=_default_move_timeout, ge=5, le=3600)
     max_plies: int = Field(default=400, ge=1, le=2000)
-    preset_a_reasoning_effort: Literal["default", "none", "low", "high", "max"] = "default"
-    preset_b_reasoning_effort: Literal["default", "none", "low", "high", "max"] = "default"
+    preset_a_reasoning_effort: Literal["default", "none", "low", "medium", "high", "max"] = "default"
+    preset_b_reasoning_effort: Literal["default", "none", "low", "medium", "high", "max"] = "default"
+    mode: Literal["direct", "agent"] = "direct"
+    agent_max_rounds: int = Field(default=6, ge=1, le=20)
 
 
 class ModelReply(BaseModel):

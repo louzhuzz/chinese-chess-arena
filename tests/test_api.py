@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 
+from backend.app.models import AGENT_PROMPT_VERSION
 from backend.app.rules import RULESET_ID, START_FEN
 from backend.app.schemas import GameCreate
 from tests.conftest import MATE_IN_ONE_FEN, set_model
@@ -116,6 +117,56 @@ def test_persistent_illegal_answer_is_a_technical_loss(api):
     assert game["status"] == "finished"
     assert (game["winner"], game["reason"]) == ("black", "invalid_move")
     assert len(game["moves"]) == 2 and all(move["error"] for move in game["moves"])
+
+
+def test_agent_game_runs_over_both_wire_protocols(api):
+    """智能体模式跑在真实协议写法上：openai_chat 的红方与 anthropic 的黑方都能连续调用工具并落子。"""
+    client, _ = api
+    game = wait_for_game(client, start_game(client, mode="agent", max_plies=2))
+    assert game["prompt_version"] == AGENT_PROMPT_VERSION
+    assert len(game["history"]) == 2
+    timeline = game["timeline"]
+    assert timeline["mode"] == "agent" and timeline["max_rounds"] == 6
+    assert [move["side"] for move in timeline["moves"]] == ["red", "black"]
+    for move in timeline["moves"]:
+        assert (move["requests"], move["tools"], move["submits"]) == (2, 1, 1)
+        assert [action["kind"] for action in move["actions"]] == ["request", "tool", "request", "submit"]
+        assert move["actions"][1]["name"] == "get_legal_moves"
+    red, black = timeline["moves"]
+    assert red["input_tokens"] == 42 and red["output_tokens"] == 10      # 两手各 21/5
+    assert black["cache_read_tokens"] == 6 and black["cache_write_tokens"] == 8  # Anthropic 缓存字段
+    assert timeline["total"]["requests"] == 4
+
+
+def test_agent_game_runs_over_responses_protocol(api):
+    """openai_responses 的 function_call / function_call_output 也能连续往返。"""
+    client, _ = api
+    game = wait_for_game(client, start_game(client, red_preset_id="tool-red", black_preset_id="red",
+                                           mode="agent", max_plies=2))
+    assert len(game["history"]) == 2
+    assert game["timeline"]["total"]["requests"] == 4
+
+
+def test_agent_timeline_endpoints(api):
+    """行动回放既能进 /api/games/{id}，也能单独按 JSON / 文本下载。"""
+    client, _ = api
+    game_id = start_game(client, mode="agent", max_plies=2)
+    game = wait_for_game(client, game_id)
+    standalone = client.get(f"/api/games/{game_id}/timeline")
+    assert standalone.status_code == 200
+    assert standalone.json()["total"] == game["timeline"]["total"]
+    text = client.get(f"/api/games/{game_id}/timeline.txt")
+    assert text.status_code == 200
+    assert "attachment" in text.headers["content-disposition"]
+    assert f"game-{game_id[:8]}-timeline.txt" in text.headers["content-disposition"]
+    assert "模式 agent" in text.text and "合计:" in text.text
+
+
+def test_direct_game_has_no_agent_timeline(api):
+    """直接模式不带智能体回放，避免网页对着空表渲染。"""
+    client, _ = api
+    game = wait_for_game(client, start_game(client, max_plies=2))
+    assert "timeline" not in game and game["mode"] == "direct"
 
 
 def test_stop_marks_the_game_stopped(api):

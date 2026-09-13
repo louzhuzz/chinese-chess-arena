@@ -12,11 +12,14 @@ from typing import Any
 import httpx
 
 from .arbiter import Arbiter, Verdict
+from .agent import AgentTurn
 from .config import ConfigStore
 from .db import Database
-from .models import PROMPT_VERSION, ModelClient, ModelConfigError, RequestMetrics, parse_move, parse_note, serialize_position
+from .models import (AGENT_PROMPT_VERSION, PROMPT_VERSION, ModelClient, ModelConfigError, RequestMetrics,
+                     parse_move, parse_note, serialize_position)
 from .rules import START_FEN, apply_history, apply_move, chinese_notation, pieces, to_fen
 from .schemas import BenchmarkCreate, GameCreate, Preset
+from .tools import RuleTools, NoteStore
 
 # A finished game is only scored when the arbiter produced a rule result.
 UNSCORED_REASONS = {"api_failure", "arbiter_failure", "process_restart", "user_stopped"}
@@ -24,6 +27,18 @@ FORFEIT_REASONS = {"invalid_move", "timeout"}
 HUMAN_PROTOCOL = "human"
 CONTEXT_MAX_MESSAGES = 48
 CONTEXT_KEEP_MESSAGES = 24
+# 首次请求给纠错重试留的余量：min(整步剩余 × SHARE, CAP) 秒。
+CORRECTION_RESERVE_SHARE = 0.2
+CORRECTION_RESERVE_CAP = 30.0
+
+
+def first_attempt_budget(remaining: float) -> float:
+    """首次请求可用的秒数。
+
+    小预算仍按 80% 分配（120 秒 → 首答 96 秒，与旧行为一致）；
+    预算放宽后只留固定 30 秒给纠错重试，慢速推理模型才能真正用满整步时限。
+    """
+    return max(0.0, remaining - min(remaining * CORRECTION_RESERVE_SHARE, CORRECTION_RESERVE_CAP))
 
 
 def now() -> str: return datetime.now(timezone.utc).isoformat()
@@ -68,12 +83,14 @@ class GameRunner:
         self.db.execute("""INSERT INTO games
             (id,status,red_preset,black_preset,initial_fen,current_fen,history_json,winner,reason,
              move_timeout,max_plies,ruleset_id,created_at,updated_at,benchmark_id,
-             red_config_json,black_config_json,prompt_version)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             red_config_json,black_config_json,prompt_version,mode,agent_max_rounds)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (game_id,"queued",spec.red_preset_id,spec.black_preset_id,fen,fen,"[]",None,None,
              spec.move_timeout_seconds,spec.max_plies,self.arbiter.backend,stamp,stamp,benchmark_id,
              json.dumps(red_preset.model_dump(),ensure_ascii=False),
-             json.dumps(black_preset.model_dump(),ensure_ascii=False),PROMPT_VERSION))
+             json.dumps(black_preset.model_dump(),ensure_ascii=False),
+             AGENT_PROMPT_VERSION if spec.mode=="agent" else PROMPT_VERSION,
+             spec.mode,spec.agent_max_rounds))
         return game_id
 
     def start(self, game_id: str):
@@ -211,10 +228,14 @@ class GameRunner:
                 if self.is_human(game["red_preset"] if side=="red" else game["black_preset"]):
                     selected, error, record = await self._human_move(game_id, side, legal, view, state, game)
                     attempt = 1
+                elif game.get("mode") == "agent":
+                    selected, error, attempt, record = await self._agent_move(game_id, side, preset, view, state, game)
                 else:
                     selected, error, attempt, record = await self._model_move(game_id, side, preset, legal, view, state, game)
                 if error:
-                    if error=="timeout": await self._finish(game_id,"finished","black" if side=="red" else "red","timeout")
+                    if error == "cancelled": return
+                    if error in {"timeout", "agent_no_submit", "agent_rounds_exhausted", "agent_output_limit"}:
+                        await self._finish(game_id,"finished","black" if side=="red" else "red","timeout")
                     elif error.startswith("api_error"): await self._finish(game_id,"finished",None,"api_failure")
                     else: await self._finish(game_id,"finished","black" if side=="red" else "red","invalid_move")
                     return
@@ -228,6 +249,139 @@ class GameRunner:
         except Exception as exc:
             await self._finish(game_id,"aborted",None,f"arbiter_failure:{type(exc).__name__}")
         finally: self.tasks.pop(game_id,None)
+
+    async def _agent_move(self, game_id, side, preset, view, state, game):
+        """智能体模式的一手：模型可在同一手里连续调用规则工具，直到正式提交。
+
+        预算按整手管理（时间、轮数、输出用量都在这一手累计）；只有 submit_move 真正落子，
+        重复提交、过期 position_id、停止后的迟到提交都会被拒绝。平台不替模型选招。
+        """
+        ply = len(game["history"])
+        try:
+            self.client.resolve(preset)
+        except ModelConfigError as exc:
+            error = f"api_error: config: {exc}"
+            record = self._attempt_record(game_id, ply, side, None, to_fen(state), view, None, 0, 1, error)
+            self._record_attempt(**record)
+            return None, error, 1, record
+        started = time.perf_counter()
+        deadline = time.monotonic() + game["move_timeout"]
+        tools = self._rule_tools(game_id, side, game, expired=lambda: time.monotonic() >= deadline)
+        position_message = self._agent_position_message(game, side, view, state, tools, preset)
+        turn = AgentTurn(client=self.client, preset=preset, tools=tools, side=side, ply=ply,
+                         deadline=deadline, position_message=position_message,
+                         max_rounds=int(game.get("agent_max_rounds") or 6),
+                         cancelled=lambda: self._stale(game_id, ply),
+                         on_action=lambda action: self._record_action(game_id, ply, side, action))
+        try:
+            outcome = await turn.run()
+        except asyncio.CancelledError:
+            raise
+        duration = int((time.perf_counter() - started) * 1000)
+        self._record_actions(game_id, ply, side, outcome.actions)   # 兜底：重复行由 INSERT OR IGNORE 忽略
+        error = self._agent_error(outcome)
+        selected = outcome.move if not error else None
+        metrics = RequestMetrics()
+        rounds = [{"round": (action.args or {}).get("round"), "tools": (action.args or {}).get("tools"),
+                   "max_tokens": (action.args or {}).get("max_tokens"),
+                   "timeout_seconds": (action.args or {}).get("timeout_seconds"),
+                   "reasoning_effort": (action.args or {}).get("reasoning_effort"),
+                   "finish_reason": action.finish_reason, "duration_ms": action.duration_ms,
+                   "input_tokens": action.total_input_tokens if action.total_input_tokens is not None else action.input_tokens,
+                   "output_tokens": action.output_tokens, "error": action.error,
+                   "sent": action.request} for action in outcome.actions if action.kind == "request"]
+        metrics.actual_request = {"mode": "agent", "requests": outcome.requests,
+                                  "max_rounds": turn.max_rounds,
+                                  "output_token_limit": preset.max_tokens,
+                                  "output_tokens_used": outcome.output_tokens,
+                                  "elapsed_ms": duration, "error": error,
+                                  "rounds": rounds,
+                                  "actions": [{"kind": a.kind, "name": a.name} for a in outcome.actions]}
+        record = self._attempt_record(game_id, ply, side, selected, to_fen(state),
+                                      json.loads(position_message), None, duration, 1, error, metrics,
+                                      token_override=(outcome.input_tokens, outcome.output_tokens,
+                                                      outcome.cache_read_tokens, outcome.cache_write_tokens))
+        if error:
+            self._record_attempt(**record)     # 失败的整手自己落一行；成功的那行由 run 循环与落子同事务写入
+        return selected, error, 1, record
+
+    def _rule_tools(self, game_id: str, side: str, game: dict, expired=None) -> RuleTools:
+        return RuleTools(arbiter=self.arbiter, game_id=game_id, side=side, initial_fen=game["initial_fen"],
+                         history=game["history"], note_store=NoteStore(self.db, game_id, side), expired=expired)
+
+    def _agent_position_message(self, game: dict, side: str, view: dict, state, tools: RuleTools,
+                                preset: Preset) -> str:
+        """每手开头自动给出的紧凑局面：完整棋子表、上一手、短笔记与预算，不需要模型先调工具读棋盘。"""
+        last_move = None
+        if game["history"]:
+            last = game["history"][-1]
+            before = apply_history(game["initial_fen"], game["history"][:-1], validate=False)
+            captured = next((p.model_dump() for p in pieces(before) if p.square == last[2:]), None)
+            last_move = {"move": last, "side": "black" if side == "red" else "red",
+                         "notation": chinese_notation(to_fen(before), last), "captured": captured}
+        payload = {
+            "game_id": game["id"],
+            "ply": len(game["history"]),
+            "player_side": side,
+            "side_to_move": view["side_to_move"],
+            "position_id": tools.position_id,
+            "pieces": view["pieces"],
+            "in_check": view["in_check"],
+            "history_length": len(game["history"]),
+            "history_tail": game["history"][-8:],
+            "last_move": last_move,
+            "private_note": tools.note_store.read() if tools.note_store else None,
+            "ruleset_id": view["ruleset_id"],
+            "move_timeout_seconds": game["move_timeout"],
+            "max_rounds": int(game.get("agent_max_rounds") or 6),
+            "output_token_limit": preset.max_tokens,
+        }
+        return serialize_position(payload)
+
+    @staticmethod
+    def _agent_error(outcome) -> str | None:
+        """智能体一手的失败映射：没有成功提交就记录精确原因，平台不替它挑一步棋。"""
+        if outcome.move:
+            return None
+        if not outcome.error:
+            return "agent_no_submit"
+        if outcome.error.startswith("api_error"):
+            return outcome.error
+        return outcome.error
+
+    def _stale(self, game_id: str, ply: int) -> bool:
+        """停止、被替换或手数已经前进时，迟到的工具/提交都不再生效。"""
+        current = self.db.game(game_id)
+        return not current or current["status"] != "running" or len(current["history"]) != ply
+
+    def _record_actions(self, game_id: str, ply: int, side: str, actions) -> None:
+        if not actions:
+            return
+        with self.db.connect() as conn:
+            for action in actions:
+                self._insert_action(conn, game_id, ply, side, action)
+
+    async def _record_action(self, game_id: str, ply: int, side: str, action) -> None:
+        """一条行动刚落定就落盘并推事件：网页能实时看到本手的行动链条。"""
+        with self.db.connect() as conn:
+            self._insert_action(conn, game_id, ply, side, action)
+        await self.bus.publish(game_id, {"type": "action", "game_id": game_id, "ply": ply, "side": side,
+                                         "kind": action.kind, "name": action.name})
+
+    def _insert_action(self, conn, game_id: str, ply: int, side: str, action) -> None:
+        row = action.to_row()
+        conn.execute("""INSERT OR IGNORE INTO agent_actions
+            (game_id,ply,side,attempt,sequence,kind,name,args_json,result_json,text,duration_ms,
+             input_tokens,output_tokens,total_input_tokens,cache_read_tokens,cache_write_tokens,
+             connect_ms,first_byte_ms,provider_request_id,finish_reason,error,created_at,
+             request_json,raw_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (game_id, ply, side, 1, action.sequence, row["kind"], row["name"], row["args_json"],
+             row["result_json"], row["text"], row["duration_ms"], row["input_tokens"],
+             row["output_tokens"], row["total_input_tokens"], row["cache_read_tokens"],
+             row["cache_write_tokens"], row["connect_ms"], row["first_byte_ms"],
+             row["provider_request_id"], row["finish_reason"], row["error"], now(),
+             row["request_json"], row["raw_json"]))
 
     async def _human_move(self, game_id, side, legal, view, state, game):
         """Wait for a move submitted over the API; a human has a much longer budget."""
@@ -285,7 +439,7 @@ class GameRunner:
             try:
                 remaining=deadline-time.monotonic()
                 if remaining <= 0: raise asyncio.TimeoutError
-                request_deadline = min(deadline, time.monotonic()+remaining*0.8) if attempt==1 else deadline
+                request_deadline = time.monotonic()+first_attempt_budget(remaining) if attempt==1 else deadline
                 for api_try in (1,2):
                     remaining = deadline-time.monotonic()
                     request_remaining = request_deadline-time.monotonic()
@@ -327,7 +481,7 @@ class GameRunner:
 
     @staticmethod
     def _illegal_move_error(move, state):
-        message = f"Illegal move: {move}. 不在当前 legal_moves 中。"
+        message = f"着法 {move} 不合法：不在当前合法着法（legal_moves）中。"
         source, target = move[:2], move[2:]
         piece = state.board.get(source)
         if not piece:
@@ -359,21 +513,30 @@ class GameRunner:
         return text[:1000]
 
     @staticmethod
-    def _attempt_record(game_id,ply,side,move,fen,prompt,result,duration,attempt,error,metrics=None):
+    def _attempt_record(game_id,ply,side,move,fen,prompt,result,duration,attempt,error,metrics=None,
+                        token_override=None):
         return dict(game_id=game_id,ply=ply,side=side,move=move,fen=fen,prompt=prompt,result=result,
-                    duration=duration,attempt=attempt,error=error,metrics=metrics)
+                    duration=duration,attempt=attempt,error=error,metrics=metrics,token_override=token_override)
 
     def _record_attempt(self,game_id,ply,side,move,fen,prompt,result,duration,attempt,error,metrics=None,
-                        fen_after=None,conn=None):
+                        fen_after=None,conn=None,token_override=None):
+        """token_override 是智能体整手的累计用量 (输入, 输出, 缓存读, 缓存写)：一手多次请求只落一行。"""
+        tokens = token_override or (None, None, None, None)
+        total_input = result.total_input_tokens if result else tokens[0]
+        output_tokens = result.output_tokens if result else tokens[1]
+        cache_read = result.cache_read_tokens if result else tokens[2]
+        cache_write = result.cache_write_tokens if result else tokens[3]
+        # 智能体模式没有单次回复，input_tokens 记为整手累计输入，便于与直接模式同表比较。
+        input_tokens = result.input_tokens if result else total_input
         values=(game_id,ply,side,move,fen,fen_after,json.dumps(prompt,ensure_ascii=False),
                 result.text if result else None,json.dumps(result.raw,ensure_ascii=False) if result else None,
-                duration,result.input_tokens if result else None,result.output_tokens if result else None,
+                duration,input_tokens,output_tokens,
                 attempt,error,now(),parse_note(result.text) if result else None,
                 metrics.connect_ms if metrics else None,metrics.first_byte_ms if metrics else None,
                 metrics.provider_request_id if metrics else None,
-                result.total_input_tokens if result else None,
-                result.cache_read_tokens if result else None,
-                result.cache_write_tokens if result else None,
+                total_input,
+                cache_read,
+                cache_write,
                 result.cache_miss_tokens if result else None,
                 json.dumps(metrics.actual_request,ensure_ascii=False) if metrics and metrics.actual_request else None)
         sql="""INSERT INTO moves(game_id,ply,side,move,fen_before,fen_after,prompt_json,response_text,
@@ -408,7 +571,8 @@ class BenchmarkRunner:
                     game_id=self.games.create(GameCreate(red_preset_id=red,black_preset_id=black,
                         initial_fen=spec.initial_fen,move_timeout_seconds=spec.move_timeout_seconds,
                         max_plies=spec.max_plies,red_reasoning_effort=red_effort,
-                        black_reasoning_effort=black_effort),bench_id)
+                        black_reasoning_effort=black_effort,mode=spec.mode,
+                        agent_max_rounds=spec.agent_max_rounds),bench_id)
                     self.games.start(game_id)
                     while (game:=self.db.game(game_id)) and game["status"] in {"queued","running"}: await asyncio.sleep(.1)
                     await self.bus.publish(bench_id,{"type":"benchmark_progress","game_id":game_id})
@@ -490,7 +654,7 @@ def _usage(games:list[dict],moves:list[dict],config:ConfigStore)->list[dict]:
     return sorted(totals.values(),key=lambda item:item["preset_id"])
 
 
-def _ratio(a,b): return round(a/b,4) if b else None
+def _ratio(a,b): return round(a/b,4) if a is not None and b else None
 
 
 def _sum_known(items: list[dict], key: str) -> int | None:

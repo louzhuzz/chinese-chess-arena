@@ -207,6 +207,17 @@ def legal_moves(state: State) -> list[str]:
     return sorted(result)
 
 
+def piece_targets(state: State, origin: str) -> list[str]:
+    """该棋子按走子规则能到的格子（不做自将过滤，也不看是否吃子）。
+
+    给「这一步为什么不能这么走」这类解释用：能到但不在 legal_moves 里，才是自将一类的原因。
+    """
+    piece = state.board.get(origin)
+    if not piece:
+        return []
+    return sorted(origin + target for target in _pseudo_targets(state, origin, piece))
+
+
 def in_check(state: State, side: str | None = None) -> bool:
     side = side or state.turn
     king = next((sq for sq, p in state.board.items() if p == ("K" if side == "red" else "k")), None)

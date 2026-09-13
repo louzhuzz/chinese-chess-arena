@@ -9,15 +9,17 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import ConfigStore
 from .db import Database
 from .provider_catalog import builtin_provider_catalog, provider_for_connection
+from .record import positions_filename, record_filename, render_fen_positions, render_fen_record
 from .rules import START_FEN, apply_history, chinese_notation, pieces
 from .runner import BenchmarkRunner, EventBus, GameRunner
 from .schemas import AnalyzeRequest, AnalyzeResult, BenchmarkCreate, ConnectionIn, GameCreate, MoveSubmit, Preset
+from .timeline import build_timeline, render_timeline
 
 db=Database(); config=ConfigStore(); bus=EventBus(); games=GameRunner(db,config,bus); benchmarks=BenchmarkRunner(db,games,bus,config)
 
@@ -144,6 +146,8 @@ def get_game(game_id:str, include_context: bool = False):
             FROM context_messages WHERE game_id=? AND side=?""", (game_id, side))
                                    for side in ("red", "black")}
     game["awaiting"]=games.awaiting(game_id)
+    if game.get("mode") == "agent":
+        game["timeline"]=build_timeline(db, game, lambda side: games._preset_for(game, side))
     if game["awaiting"]:
         try:
             verdict=games.inspect(game_id)
@@ -192,6 +196,35 @@ async def game_events(game_id:str):
 
 @app.get("/api/games/{game_id}/export.json")
 def export_game(game_id:str): return get_game(game_id, include_context=True)
+
+
+@app.get("/api/games/{game_id}/export.fen")
+def export_game_fen(game_id:str,positions:bool=False):
+    """标准 FEN 棋谱。默认是带信息的棋谱文本；`positions=true` 返回纯 FEN 序列。"""
+    if not db.game(game_id): raise HTTPException(404,"Game not found")
+    game=get_game(game_id)
+    body=render_fen_positions(game) if positions else render_fen_record(game)
+    filename=positions_filename(game_id) if positions else record_filename(game_id)
+    return PlainTextResponse(body,media_type="text/plain; charset=utf-8",
+                             headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/games/{game_id}/timeline")
+def game_timeline(game_id:str):
+    """智能体模式的行动回放：每手的请求、工具调用、落子与费用。"""
+    game=db.game(game_id)
+    if not game: raise HTTPException(404,"Game not found")
+    return build_timeline(db, game, lambda side: games._preset_for(game, side))
+
+
+@app.get("/api/games/{game_id}/timeline.txt")
+def game_timeline_text(game_id:str):
+    game=db.game(game_id)
+    if not game: raise HTTPException(404,"Game not found")
+    timeline=build_timeline(db, game, lambda side: games._preset_for(game, side))
+    filename=f"game-{game_id[:8]}-timeline.txt"
+    return PlainTextResponse(render_timeline(game, timeline),media_type="text/plain; charset=utf-8",
+                             headers={"Content-Disposition":f'attachment; filename="{filename}"'})
 
 
 @app.post("/api/benchmarks",status_code=202)

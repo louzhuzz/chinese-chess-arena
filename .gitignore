@@ -17,8 +17,5 @@ native/build/
 native/
 vendor/
 data/
-run/*.json
-run/*.log
-run/*.out
-run/check_submission_prompt.py
+run/
 server.*.log

@@ -34,3 +34,45 @@
 .model-group article{display:flex;flex-direction:column;align-items:flex-start;border:1px solid #d3c8b6;background:#f8f4eb;padding:11px;text-align:left;min-width:0}
 
 .provider-hint{display:grid;grid-column:1/-1;gap:4px;padding:10px 12px;border-left:3px solid #b59a73;background:#f6f0e4;color:#756b5b;font-size:11px;line-height:1.45}
+.quick{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:-2px 0 12px}.quick button{padding:6px 0;font-size:11px;border:1px solid #b9ad99;background:#f9f6ef;color:#716859}.quick button.on{border-color:var(--red);color:var(--red);background:#f7ece9}
+.record-actions{display:flex;align-items:center;gap:8px}.record-actions .export{display:flex;align-items:center;gap:5px;font-size:11px;padding:6px 9px;border:1px solid #b9ad99;background:#f9f6ef;color:#716859;text-decoration:none}.record-actions .export:hover{border-color:var(--red);color:var(--red)}.record-actions svg{width:13px}
+.player-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
+.player-actions .resume,.player-actions .stop{border:1px solid #a99d89;background:none;padding:7px 10px;display:flex;align-items:center;gap:5px;font-size:12px}
+.player-actions .resume{border-color:var(--red);color:var(--red)}
+.player-actions .resume:hover{background:#f7ece9}
+.player-actions .stop{margin-left:0}
+.player-actions svg{width:13px}
+.player-actions em{margin-left:0}
+.secondary{width:100%;margin-top:8px;border:1px solid #b9ad99;background:#f9f6ef;color:#5d5346;padding:12px;display:flex;align-items:center;justify-content:center;gap:8px}
+.secondary:hover{border-color:var(--red);color:var(--red);background:#f7ece9}
+.secondary svg{width:15px}
+.editor-actions button{border:1px solid #b9ad99;background:#f9f6ef;color:#5d5346;padding:8px 12px}
+.editor-actions button:hover{border-color:var(--red);color:var(--red)}
+
+/* 智能体行动回放：一手内的请求、工具调用与费用 */
+.moves .chain{display:block;font-family:Georgia,serif!important;color:#6f6353!important;font-size:11px;line-height:1.4;white-space:normal;margin-top:2px}
+.agent-trace{margin:10px 0 4px;border:1px solid #cfc4b2;background:#f8f4eb}
+.agent-trace>summary{cursor:pointer;padding:9px 11px;font-size:11px;color:#6f6353;line-height:1.5}
+.trace-list{display:grid;gap:1px;background:#ded5c6;max-height:340px;overflow:auto}
+.trace-list article{background:#fbf8f1;padding:9px 11px}
+.trace-list article.bad{background:#f9ece8}
+.trace-list header{display:flex;align-items:baseline;gap:7px;font-size:11px;color:#6f6353}
+.trace-list header b{font:11px Georgia;color:#fff;background:var(--red);width:20px;height:20px;display:grid;place-items:center}
+.trace-list header em{margin-left:auto;font-style:normal;font-size:10px;color:#88785f}
+.trace-list .chain{margin:6px 0 0;font-size:11px;color:#4f4636}
+.trace-list ul{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:3px}
+.trace-list li{display:flex;flex-wrap:wrap;gap:6px;font-size:10px;color:#7a6f5f;border-top:1px dashed #e0d7c8;padding-top:3px}
+.trace-list li.bad{color:#9e2e22}
+.trace-list li .kind{font-weight:700;color:#4f4636;min-width:74px}
+.trace-list li.bad .kind{color:#9e2e22}
+.trace-list li .detail{flex:1;min-width:0;word-break:break-all}
+.trace-list li i{font-style:normal;color:#9b8e79}
+
+/* 对弈模式选择：一次定一步 / 规则工具 */
+.mode-pick{display:grid;gap:6px;margin:0 0 12px}
+.mode-pick>span{font-size:11px;color:#88785f}
+.mode-pick>div{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.mode-pick button{padding:8px 0;font-size:12px;border:1px solid #b9ad99;background:#f9f6ef;color:#716859}
+.mode-pick button.on{border-color:var(--red);color:var(--red);background:#f7ece9}
+.mode-pick .rounds{display:flex;align-items:center;gap:8px;font-size:11px;color:#716859}
+.mode-pick .rounds input{width:70px;padding:6px}

@@ -7,8 +7,8 @@ from backend.app.arbiter import Arbiter
 from backend.app.rules import RULESET_ID
 from backend.app.config import ConfigStore
 from backend.app.db import Database
-from backend.app.runner import EventBus, GameRunner
-from backend.app.schemas import GameCreate
+from backend.app.runner import EventBus, GameRunner, first_attempt_budget
+from backend.app.schemas import DEFAULT_MOVE_TIMEOUT, GameCreate
 
 
 def make_config(path: Path):
@@ -23,6 +23,18 @@ def make_config(path: Path):
 def make_runner(tmp_path, arbiter=None):
     cfg_path=tmp_path/"models.yaml"; make_config(cfg_path)
     return GameRunner(Database(tmp_path/"test.db"),ConfigStore(cfg_path),EventBus(),arbiter=arbiter)
+
+
+def test_move_timeout_defaults_and_first_attempt_budget():
+    """默认每步时限放宽到 10 分钟；首答只给纠错留固定 30 秒余量。"""
+    assert DEFAULT_MOVE_TIMEOUT == 600
+    assert GameCreate(red_preset_id="a",black_preset_id="b").move_timeout_seconds == 600
+    # 小预算保持旧行为：120 秒仍按 80% 给首答 96 秒。
+    assert first_attempt_budget(120) == 96
+    assert first_attempt_budget(5) == 4
+    # 大预算不再按比例砍：600 秒首答可用 570 秒，比旧的 96 秒宽 6 倍。
+    assert first_attempt_budget(600) == 570
+    assert first_attempt_budget(1800) == 1770
 
 
 def test_mock_models_complete_truncated_game(tmp_path):

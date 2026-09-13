@@ -56,10 +56,32 @@ class Database:
               id TEXT PRIMARY KEY, status TEXT NOT NULL, preset_a TEXT NOT NULL, preset_b TEXT NOT NULL,
               pairs INTEGER NOT NULL, settings_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_actions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT NOT NULL, ply INTEGER NOT NULL, side TEXT NOT NULL,
+              attempt INTEGER NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT,
+              args_json TEXT, result_json TEXT, text TEXT, duration_ms INTEGER, input_tokens INTEGER,
+              output_tokens INTEGER, total_input_tokens INTEGER, cache_read_tokens INTEGER,
+              cache_write_tokens INTEGER, connect_ms INTEGER, first_byte_ms INTEGER,
+              provider_request_id TEXT, finish_reason TEXT, error TEXT, created_at TEXT NOT NULL,
+              request_json TEXT, raw_json TEXT,
+              UNIQUE(game_id, ply, attempt, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS agent_notes (
+              game_id TEXT NOT NULL, side TEXT NOT NULL, text TEXT NOT NULL, ply INTEGER NOT NULL,
+              updated_at TEXT NOT NULL, PRIMARY KEY(game_id, side)
+            );
             """)
             self._add_column(c, "games", "red_config_json", "TEXT")
             self._add_column(c, "games", "black_config_json", "TEXT")
             self._add_column(c, "games", "prompt_version", "TEXT")
+            self._add_column(c, "games", "mode", "TEXT")
+            self._add_column(c, "games", "agent_max_rounds", "INTEGER")
+            self._add_column(c, "agent_actions", "cache_write_tokens", "INTEGER")
+            self._add_column(c, "agent_actions", "connect_ms", "INTEGER")
+            self._add_column(c, "agent_actions", "first_byte_ms", "INTEGER")
+            self._add_column(c, "agent_actions", "finish_reason", "TEXT")
+            self._add_column(c, "agent_actions", "request_json", "TEXT")
+            self._add_column(c, "agent_actions", "raw_json", "TEXT")
             self._add_column(c, "moves", "note", "TEXT")
             self._add_column(c, "moves", "actual_request_json", "TEXT")
             self._add_column(c, "moves", "connect_ms", "INTEGER")

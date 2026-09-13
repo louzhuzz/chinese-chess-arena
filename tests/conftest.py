@@ -41,6 +41,46 @@ def _choose(policy: str, position: dict) -> str | None:
     return legal[0]
 
 
+def _strings(value) -> list[str]:
+    """把请求体里所有字符串摊平，便于按协议无关的方式找工具结果。"""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _strings(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+def _agent_step(policy: str, body: dict) -> tuple[str, dict]:
+    """工具调用：先问 get_legal_moves，拿到结果后按策略提交一步。
+
+    这是三种线上协议的共同假体：只依赖请求体里出现过的工具结果，不自己算棋。
+    """
+    legal: list[str] = []
+    position_id: str | None = None
+    for text in _strings(body):
+        if not text.lstrip().startswith("{"):
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("moves"), list):
+            legal = [move for move in data["moves"] if isinstance(move, str)] or legal
+            if isinstance(data.get("position_id"), str):
+                position_id = data["position_id"]
+    if not legal:
+        return "get_legal_moves", {}
+    move = _choose(policy, {"legal_moves": legal})
+    if move is None:
+        move = legal[0]
+    arguments = {"move": move}
+    if position_id:
+        arguments["position_id"] = position_id
+    return "submit_move", arguments
+
+
 class FakeModelHandler(BaseHTTPRequestHandler):
     """OpenAI Chat, OpenAI Responses and Anthropic Messages, driven by preset.model."""
 
@@ -59,6 +99,25 @@ class FakeModelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _agent_reply(self, path: str, name: str, arguments: dict) -> dict:
+        """同一个工具调用在三种协议里的写法。"""
+        call_id = f"fake-call-{name}"
+        if path.endswith("/chat/completions"):
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                        {"id": call_id, "type": "function",
+                         "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}]},
+                        "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 21, "completion_tokens": 5}}
+        if path.endswith("/responses"):
+            return {"output": [{"type": "function_call", "call_id": call_id, "name": name,
+                                "arguments": json.dumps(arguments, ensure_ascii=False)}],
+                    "status": "completed",
+                    "usage": {"input_tokens": 21, "output_tokens": 5}}
+        return {"content": [{"type": "tool_use", "id": call_id, "name": name, "input": arguments}],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 21, "output_tokens": 5,
+                          "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4}}
+
     def do_GET(self) -> None:
         if self.path.endswith("/models"):
             self._send({"data": [{"id": "fake-model"}]})
@@ -75,6 +134,10 @@ class FakeModelHandler(BaseHTTPRequestHandler):
             return
         if policy == "slow":
             time.sleep(8)
+        if body.get("tools"):  # 智能体模式：按各协议的工具调用格式回一次
+            name, arguments = _agent_step(policy, body)
+            self._send(self._agent_reply(self.path, name, arguments))
+            return
         move = _choose(policy, json.loads(_prompt(body, self.path)))
         if move is None:  # 模拟推理模型把预算花光、正文为空的截断情况
             if self.path.endswith("/chat/completions"):
@@ -129,11 +192,14 @@ def api(tmp_path, monkeypatch, fake_models):
              "extra_headers": {"X-API-Token": "header-secret", "X-Region": "local"}},
             {"id": "claude", "name": "Claude fake", "protocol": "anthropic_messages",
              "base_url": fake_models, "api_key": "sk-ant-secret"},
+            {"id": "responses", "name": "Responses fake", "protocol": "openai_responses",
+             "base_url": fake_models + "/v1", "api_key": "sk-resp-secret"},
             {"id": "human", "name": "Human", "protocol": "human", "base_url": ""},
         ],
         "presets": [
             {"id": "red", "name": "Red", "connection_id": "openai", "model": "first"},
             {"id": "black", "name": "Black", "connection_id": "claude", "model": "first"},
+            {"id": "tool-red", "name": "Tool red", "connection_id": "responses", "model": "first"},
             {"id": "human-red", "name": "我执红", "connection_id": "human", "model": "human"},
             {"id": "human-black", "name": "我执黑", "connection_id": "human", "model": "human"},
         ],
