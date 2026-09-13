@@ -16,7 +16,7 @@ from .agent import AgentTurn
 from .config import ConfigStore
 from .db import Database
 from .models import (AGENT_PROMPT_VERSION, PROMPT_VERSION, ModelClient, ModelConfigError, RequestMetrics,
-                     parse_move, parse_note, serialize_position)
+                     describe_error, parse_move, parse_note, serialize_position)
 from .rules import START_FEN, apply_history, apply_move, chinese_notation, pieces, to_fen
 from .schemas import BenchmarkCreate, GameCreate, Preset
 from .tools import RuleTools, NoteStore
@@ -463,7 +463,7 @@ class GameRunner:
             except (ValueError, json.JSONDecodeError) as exc:
                 error=str(exc)
             except Exception as exc:
-                error=f"api_error: {type(exc).__name__}: {exc}"
+                error=f"api_error: {type(exc).__name__}: {describe_error(exc)}"
             if result is not None and not error:
                 prompt_text = (f"{context_header}\n{serialize_position(attempt_view)}"
                                if context_header else serialize_position(attempt_view))

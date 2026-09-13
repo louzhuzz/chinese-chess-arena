@@ -21,12 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import yaml
+import httpx
 
 from backend.app.agent import AgentAction, AgentTurn
 from backend.app.arbiter import Arbiter
 from backend.app.config import ConfigStore
 from backend.app.db import Database
-from backend.app.models import ToolCall, ToolReply
+from backend.app.models import ToolCall, ToolReply, describe_error
 from backend.app.record import render_fen_record
 from backend.app.rules import START_FEN
 from backend.app.runner import BenchmarkRunner, EventBus, GameRunner
@@ -118,9 +119,14 @@ class StrictWire(BaseHTTPRequestHandler):
         messages = body.get("messages") or []
         tool_turns = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")]
         if tool_turns:
-            if not all(m.get("reasoning_content") for m in tool_turns):
+            # 严格到底：DeepSeek 要 reasoning_content，Command Code 这类兼容网关要
+            # reasoning / reasoning_details，缺任何一个都按 400 拒绝。
+            missing = [m for m in tool_turns
+                       if not m.get("reasoning_content") or not m.get("reasoning")
+                       or not m.get("reasoning_details")]
+            if missing:
                 StrictWire.rejects += 1
-                self._send({"error": {"message": "reasoning_content is required in tool-call turns",
+                self._send({"error": {"message": "reasoning fields are required in tool-call turns",
                                       "type": "invalid_request_error"}}, 400)
                 return
             legal: list[str] = []
@@ -138,11 +144,15 @@ class StrictWire(BaseHTTPRequestHandler):
                 {"id": "call-2", "type": "function",
                  "function": {"name": "submit_move", "arguments": json.dumps({"move": move})}}]},
                 "finish_reason": "tool_calls"}],
-                "usage": {"prompt_tokens": 30, "completion_tokens": 4}})
+                "usage": {"prompt_tokens": 30, "completion_tokens": 4,
+                          "prompt_tokens_details": {"cached_tokens": 12}}})
             return
         self._send({"choices": [{"message": {
             "content": "",
             "reasoning_content": "先查合法着法，再决定走哪一步。",
+            "reasoning": "先查合法着法，再决定走哪一步。",
+            "reasoning_details": [{"type": "reasoning.text", "index": 0,
+                                   "text": "先查合法着法，再决定走哪一步。"}],
             "tool_calls": [{"id": "call-1", "type": "function",
                             "function": {"name": "get_legal_moves", "arguments": "{}"}}]},
             "finish_reason": "tool_calls"}],
@@ -171,6 +181,14 @@ def verify_reasoning_and_effort():
         check("1 第二轮请求的助手消息带 reasoning_content",
               bool(assistant) and bool(assistant[0].get("reasoning_content")),
               f"reasoning_content={assistant[0].get('reasoning_content') if assistant else None!r}")
+        check("1 兼容网关的 reasoning / reasoning_details 也原样回传",
+              bool(assistant) and bool(assistant[0].get("reasoning"))
+              and isinstance(assistant[0].get("reasoning_details"), list),
+              f"reasoning_details={json.dumps(assistant[0].get('reasoning_details'), ensure_ascii=False) if assistant else None}")
+        rows = [row for row in actions_of(runner, game_id) if row["kind"] == "request"]
+        check("1 OpenAI 风格的缓存用量被识别（prompt_tokens_details.cached_tokens）",
+              len(rows) >= 2 and rows[1]["cache_read_tokens"] == 12,
+              f"第二轮 cache_read_tokens={rows[1]['cache_read_tokens'] if len(rows) > 1 else None}")
         check("2 智能体请求带上推理强度（openai_chat / Command Code 同一路径）",
               second.get("reasoning_effort") == "low", f"reasoning_effort={second.get('reasoning_effort')!r}")
         check("2 密钥没有进入请求体", "sk-strict-secret" not in json.dumps(second),
@@ -179,6 +197,30 @@ def verify_reasoning_and_effort():
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------- 6：接口故障的可读性
+def verify_error_detail() -> None:
+    """httpx 的连接类异常 str() 常是空串：只写异常名排查不了，必须带出底层原因。"""
+    request = httpx.Request("POST", "https://api.example.com/provider/v1/chat/completions?api_key=sk-should-not-leak")
+    exc = httpx.ConnectError("", request=request)
+    exc.__cause__ = OSError("[Errno 11001] getaddrinfo failed")
+    detail = describe_error(exc)
+    check("6 空消息的连接异常也给出底层原因", "11001" in detail, detail)
+    check("6 错误信息标明失败的接口地址", "POST https://api.example.com/provider/v1/chat/completions" in detail, detail)
+    check("6 错误信息不带查询串（不泄漏密钥）", "sk-should-not-leak" not in detail and "?" not in detail, detail)
+
+    class BrokenClient:
+        async def choose_with_tools(self, preset, messages, tools, timeout, **kwargs):
+            raise exc
+
+    tools = RuleTools(arbiter=Arbiter(), game_id="g-err", side="red", initial_fen=START_FEN, history=[])
+    turn = AgentTurn(client=BrokenClient(), preset=Preset(id="p", name="p", connection_id="p", model="mock"),
+                     tools=tools, side="red", ply=0, deadline=time.monotonic() + 30,
+                     position_message="{}", max_rounds=1)
+    outcome = asyncio.run(turn.run())
+    check("6 整手失败时错误里保留同一条可读信息",
+          outcome.error and "11001" in outcome.error, f"error={outcome.error}")
 
 
 # ---------------------------------------------------------------- 6：日志完整性
@@ -401,6 +443,7 @@ def verify_benchmark_mode() -> None:
 def main() -> int:
     WORK.mkdir(parents=True, exist_ok=True)
     strict_runner, strict_game = verify_reasoning_and_effort()
+    verify_error_detail()
     verify_diagnostics(strict_runner, strict_game)
     verify_unknown_usage()
     verify_record_labels()

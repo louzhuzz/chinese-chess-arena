@@ -123,7 +123,8 @@ $env:ANTHROPIC_API_KEY = "..."
 - **没有成功提交就没有落子。** 记录 `agent_rounds_exhausted`、`agent_no_submit`、`agent_output_limit`、`timeout` 等精确原因并判该方超时，平台不擅自代选一步棋。
 - **预算按整手管理。** 时间、轮数、输出用量都在这一手累计：每轮请求的 `max_tokens` 只能是「对局冻结的输出上限 − 本手已用输出」，用尽即以 `agent_output_limit` 收手，不会每轮都重新拿满额度；单次请求不超过整手的 40%（最低 30 秒），剩余 20%（上限 30 秒）留给提交窗口，进入提交窗口后只保留 `submit_move` 并提示模型立即提交；这一手已经实测出单次请求耗时后，只要剩余时间不够「实测耗时 × 1.2」，就直接进入提交窗口而不必先发出去再超时。一次请求超时或接口故障不会立刻判负：整手保留一次「只提交」的重试（对应直接模式的纠错一次），这次请求拿到剩下的全部时间。轮数用尽即结束本手。可用 `XIANGQI_AGENT_MAX_ROUNDS`（默认 6）、`XIANGQI_AGENT_SUBMIT_RESERVE`（0.2）、`XIANGQI_AGENT_SUBMIT_RESERVE_CAP`（30 秒）、`XIANGQI_AGENT_REQUEST_CAP`（0.4）、`XIANGQI_AGENT_REQUEST_CAP_FLOOR`（30 秒）、`XIANGQI_AGENT_REQUEST_MARGIN`（1.2）、`XIANGQI_AGENT_MIN_REQUEST`（15 秒）调整。实践上建议每步时限 ≥200 秒：工具循环要发多次请求，120 秒档容易被一次慢请求吃掉大半预算。
 - **双方记忆各自独立。** 每手开头自动给一份紧凑快照（完整棋子表、最近 8 个半回合、对手上一手的移动与吃子、本方短笔记、`position_id`），跨手只带这些，不搬运旧棋盘与试走过程；一手之内完整保留工具调用与返回，便于连续判断。笔记只属于写它的那一方，永远不进入对方上下文。
-- **推理续接字段按协议回传。** 工具轮次的助手消息会把提供方的推理字段原样带回下一次请求（OpenAI 兼容的 `reasoning_content`、Responses 的 reasoning item、Anthropic 的 thinking block），否则开启思考的严格接口会在第二轮直接拒绝。
+- **推理续接字段按协议回传。** 工具轮次的助手消息会把提供方的推理字段原样带回下一次请求：OpenAI 兼容接口的 `reasoning_content`，以及部分兼容网关（如 Command Code 上的 DeepSeek）用的 `reasoning` / `reasoning_details`，另加 Responses 的 reasoning item、Anthropic 的 thinking block。少了这些字段，开启思考的严格接口会在第二轮直接拒绝。
+- **接口故障要能直接看出原因。** `api_error` 不只写异常名：会把异常链里的底层原因（如 `[Errno 11001] getaddrinfo failed`）与「方法 + 主机 + 路径」一起记下（去掉查询串，不写入密钥）。
 - **行动回放与费用。** 每次请求、每次工具调用、每次提交都写进 `agent_actions`；网页「智能体行动回放」按手数列出「查询合法着法 → 试走变化 → 校验一步 → 正式落子 a0a1」这样的链条，展开可看输入、返回、耗时、连接与首字节耗时、Provider Request ID、本轮实际发出的 `max_tokens` 与时限、提供方返回的结束原因（`finish_reason`）；每手费用按该手全部请求（含重试与失败）累计 token 与估算费用，单价或用量未知时显示「未知」，不把未知当作 0。每一轮实际发出的请求参数（已去密钥）与提供方原始回复都完整落盘在 `agent_actions.request_json` / `raw_json`，整手汇总写进 `moves.actual_request_json`，用于事后区分「输出耗尽」「参数没生效」还是「接口异常」。
 
 ## 配置

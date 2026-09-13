@@ -114,12 +114,12 @@
 
 | 评审项 | 复核结论 | 处理 |
 |---|---|---|
-| 1 多轮工具调用丢推理续接字段 | 已修：`_openai_chat_messages` / `_responses_input` / `_anthropic_agent_messages` 都会回传推理字段 | 本轮补了线上级验证（严格假提供方缺字段即 400） |
+| 1 多轮工具调用丢推理续接字段 | 已修：`_openai_chat_messages` / `_responses_input` / `_anthropic_agent_messages` 都会回传推理字段 | 本轮补了线上级验证（严格假提供方缺字段即 400），并**补上兼容网关的第二种写法**：Command Code 上 DeepSeek 返回 `reasoning` + `reasoning_details`、GLM 返回 `reasoning_content`，现在两者都按原键原样回传 |
 | 2 Claude 思考强度未透传 | 不适用：当前接入走 OpenAI 兼容协议，`reasoning_effort` 已在智能体请求中下发并验证 | 仅验证 `openai_chat` 路径，未改 Anthropic |
 | 3 批量评测仍跑直接模式 | 后端 `BenchmarkCreate` 已补 `mode` / `agent_max_rounds`，网页也已传参 | 本轮用 mock 跑通「评测 2 局全部为 agent 模式」 |
 | 4 未知用量被当成零 | 已修：缺失用量时 token 与费用都是「未知」；顺带删掉永远为 0 的 `billed_input_tokens` | **本轮新发现并修复**：`_ratio()` 在 `cache_read_tokens` 为空但总量已知时抛 `TypeError`，会让评测报告接口 500 |
 | 5 停止/截断被导成和棋 | 已修：`DRAW_REASONS` 与 `RULE_END_REASONS` 分开，停止/截断写「未计胜负」+「记录终止状态」 | 本轮定点复验四种终局，并**补上第二处**：行动回放抬头（`timeline.txt` / CLI）原来也把无胜方一律写成「和」，现在与棋谱共用 `result_text()` 同一份说法 |
-| 6 排查日志不完整 | 部分：`finish_reason` 已落盘，但每轮实际发出的参数与提供方原始回复只有汇总 | **本轮补齐**：新增 `agent_actions.request_json` / `raw_json`（含迁移），整手汇总写进 `moves.actual_request_json` 的 `rounds[]`；正文原本就没有 2000 字截断 |
+| 6 排查日志不完整 | 部分：`finish_reason` 已落盘，但每轮实际发出的参数与提供方原始回复只有汇总 | **本轮补齐**：新增 `agent_actions.request_json` / `raw_json`（含迁移），整手汇总写进 `moves.actual_request_json` 的 `rounds[]`；正文原本就没有 2000 字截断。另外修掉「接口故障只留一个异常名」：`describe_error()` 会把异常链底层原因与「方法 + 主机 + 路径」（去掉查询串）写进 `api_error` |
 | 7 落子前未再查整手截止时间 | 部分：工具调用前后已有检查，正文落子路径没有 | **本轮补齐**：工具层 `RuleTools(expired=...)` 直接拒绝超时落子，正文落子前同样检查 |
 | 8 整手输出预算没有真正限制 | 已修：每轮 `max_tokens = 冻结上限 − 本手已用`，用尽即以 `agent_output_limit` 收手 | 本轮定点复验 `[100, 40]` 与提前收手 |
 | 9 正式提交非法可反复纠正 | 已修：第二次正式提交失败即 `invalid_move` 判负；探索类调用不计数 | 本轮定点复验 |
@@ -141,6 +141,13 @@
 ```
 
 结果（对局 `841676156d844f05b222e56da499d800`，2 手，被 `max_plies` 截断）：两手的每轮请求都完整落盘 `finish_reason=tool_calls`、实际发出的 `model/max_tokens/temperature/reasoning_effort`、提供方原始回复；第一手两轮的 `max_tokens` 是 `4096 → 4091`，整手输出额度确实在递减；`timeline.txt` 与 `backend.app.cli timeline` 都打印「max_tokens、时限、结束原因」，抬头为「未计胜负 · 步数上限截断」而不是「和」。
+
+真实网关（Command Code，对局 `1fb4a1ad439748c99d61bed61e943cf9`，红 `cc-deepseek-v4-1-flash` 对黑 `cc-glm-5-3`，4 手，240 秒时限）：
+
+- 黑方第二手是完整的多轮工具循环：请求（`max_tokens=131072`）→ `check_move` → **再请求（`max_tokens=130822`）** → 落子 `b9c7`，两次请求都没有报错——说明带推理字段的助手消息被真实网关接受。
+- 同一个网关给出两种推理字段写法：DeepSeek 返回 `reasoning` + `reasoning_details`，GLM 返回 `reasoning_content`；两种都按原键回传。
+- 缓存用量：GLM 第二轮返回 `prompt_tokens_details.cached_tokens=1920`，归一后 `cache_read_tokens=1920`（缓存命中 86.8%）。
+- 四手全部合法，无接口错误、无 400。
 
 ## 复现命令
 

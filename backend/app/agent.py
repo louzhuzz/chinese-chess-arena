@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from .models import AGENT_SYSTEM_PROMPT, RequestMetrics, ToolReply, parse_move
+from .models import AGENT_SYSTEM_PROMPT, RequestMetrics, ToolReply, describe_error, parse_move
 from .tools import RuleTools, TOOL_SPECS, SUBMIT_ONLY
 
 AGENT_MAX_ROUNDS = int(os.getenv("XIANGQI_AGENT_MAX_ROUNDS", "6"))
@@ -260,7 +260,7 @@ class AgentTurn:
                 break
             except Exception as exc:  # noqa: BLE001 - 接口故障原样上报
                 action.duration_ms = int((time.perf_counter() - started) * 1000)
-                action.error = f"api_error: {type(exc).__name__}: {exc}"
+                action.error = f"api_error: {type(exc).__name__}: {describe_error(exc)}"
                 action.request = metrics.actual_request
                 outcome.input_tokens = outcome.output_tokens = None
                 outcome.cache_read_tokens = outcome.cache_write_tokens = None
@@ -319,6 +319,7 @@ class AgentTurn:
                         "reasoning_content": reply.reasoning_content,
                         "reasoning_items": reply.reasoning_items,
                         "thinking_blocks": reply.thinking_blocks,
+                        "reasoning_extra": reply.reasoning_extra,
                     })
                 if round_index == self.max_rounds - 1:
                     break
@@ -330,6 +331,7 @@ class AgentTurn:
                 "reasoning_content": reply.reasoning_content,
                 "reasoning_items": reply.reasoning_items,
                 "thinking_blocks": reply.thinking_blocks,
+                "reasoning_extra": reply.reasoning_extra,
             }
             messages.append(assistant_message)
             for call in calls:

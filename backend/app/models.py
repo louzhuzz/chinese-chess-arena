@@ -201,9 +201,14 @@ class ModelClient:
                 data = await _post_json(client, connection.base_url.rstrip("/") + "/chat/completions", headers, body, metrics)
                 choice = data["choices"][0]; message = choice.get("message") or {}; usage = data.get("usage", {})
                 calls = [_tool_call(item.get("id"), item.get("function") or {}) for item in (message.get("tool_calls") or [])]
+                # 有些兼容网关（Command Code 等）用 reasoning / reasoning_details 而不是
+                # reasoning_content；提供方给了什么就原样带回去续接。
+                reasoning_extra = {key: message[key] for key in ("reasoning", "reasoning_details")
+                                   if message.get(key) not in (None, "", [])}
                 return ToolReply(text=message.get("content") or "", calls=calls, finish_reason=choice.get("finish_reason"),
                                  input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens"),
                                  raw=data, reasoning_content=message.get("reasoning_content"),
+                                 reasoning_extra=reasoning_extra,
                                  **_cache_usage(usage, connection.protocol))
             if connection.protocol == "openai_responses":
                 headers["Authorization"] = f"Bearer {key}"
@@ -265,7 +270,8 @@ class ToolReply:
                  cache_write_tokens: int | None = None, cache_miss_tokens: int | None = None,
                  raw: dict[str, Any] | None = None, reasoning_content: str | None = None,
                  reasoning_items: list[dict[str, Any]] | None = None,
-                 thinking_blocks: list[dict[str, Any]] | None = None):
+                 thinking_blocks: list[dict[str, Any]] | None = None,
+                 reasoning_extra: dict[str, Any] | None = None):
         self.text = text
         self.calls = calls or []
         self.finish_reason = finish_reason
@@ -279,6 +285,9 @@ class ToolReply:
         self.reasoning_content = reasoning_content
         self.reasoning_items = reasoning_items or []
         self.thinking_blocks = thinking_blocks or []
+        # 提供方自己给出的、需要原样回传的推理字段（如 OpenAI 兼容网关的 reasoning /
+        # reasoning_details）：只在工具轮次里按原键回传，平台不解释、不改写。
+        self.reasoning_extra = reasoning_extra or {}
 
 
 def _tool_call(call_id: Any, function: dict[str, Any]) -> ToolCall:
@@ -329,11 +338,17 @@ def _openai_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]
             }
             if message.get("reasoning_content") is not None:
                 assistant["reasoning_content"] = message["reasoning_content"]
+            for key, value in (message.get("reasoning_extra") or {}).items():
+                assistant.setdefault(key, value)
             converted.append(assistant)
             continue
-        if role == "assistant" and message.get("reasoning_content") is not None:
-            converted.append({"role": "assistant", "content": message.get("content") or "",
-                              "reasoning_content": message["reasoning_content"]})
+        if role == "assistant" and (message.get("reasoning_content") is not None or message.get("reasoning_extra")):
+            assistant = {"role": "assistant", "content": message.get("content") or ""}
+            if message.get("reasoning_content") is not None:
+                assistant["reasoning_content"] = message["reasoning_content"]
+            for key, value in (message.get("reasoning_extra") or {}).items():
+                assistant.setdefault(key, value)
+            converted.append(assistant)
             continue
         converted.append({"role": role, "content": message.get("content") or ""})
     return converted
@@ -475,6 +490,32 @@ def _cache_usage(usage: Any, protocol: str) -> dict[str, int | None]:
 
 def _official_anthropic(base_url: str) -> bool:
     return (urlparse(base_url).hostname or "").lower().endswith("anthropic.com")
+
+
+def describe_error(exc: BaseException) -> str:
+    """接口异常的可读描述。
+
+    httpx 的 ConnectError / ReadTimeout 等 `str()` 经常是空串，只看它排查不出任何东西，
+    所以这里把异常链（`__cause__`/`__context__`）里的底层原因一起带出来，
+    并在可用时附上「方法 + 主机 + 路径」（不含查询串，避免把密钥写进日志）。
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip() or repr(current)
+        if text and text not in parts:
+            parts.append(text)
+        current = current.__cause__ or current.__context__
+    detail = " ← ".join(parts) or type(exc).__name__
+    request = getattr(exc, "request", None)
+    url = getattr(request, "url", None)
+    if url is not None:
+        target = f"{url.scheme}://{url.host}{url.path}"
+        method = getattr(request, "method", "")
+        detail = f"{method} {target} ← {detail}".strip()
+    return detail
 
 
 def _prompt_cache_key(preset: Preset, position: dict[str, Any], connection: Any) -> str | None:
